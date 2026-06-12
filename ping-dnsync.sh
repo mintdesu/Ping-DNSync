@@ -3,7 +3,6 @@
 #  Ping-DNSync
 #  基于 Ping/TCPing 检活的 Cloudflare DNS 自动同步工具
 #  依赖: bash / curl / ping (ping模式) 或 tcping二进制 (tcping模式)
-#  兼容: DSM 7.x / Debian / Ubuntu
 # ============================================================================
 
 # ──────────────────── Cloudflare 配置 ─────────────────────
@@ -200,7 +199,7 @@ do_ping() {
 do_tcping() {
     local target="$1" result_file="$2"
     local output
-    output=$("$TCPING_BIN" --no-color -c "$CHECK_COUNT" -t "$CHECK_TIMEOUT" "$target" 2>/dev/null)
+    output=$("$TCPING_BIN" --no-color --non-interactive -c "$CHECK_COUNT" -t "$CHECK_TIMEOUT" "$target" 2>/dev/null)
 
     local ok_count
     ok_count=$(echo "$output" | grep -c "Reply from" || true)

@@ -9,8 +9,8 @@
 CF_API_TOKEN="xxxxxxxxxxxxxxxxxx"
 DOMAIN="example.com"                # 根域名 (自动查询 Zone ID)
 SUBDOMAIN="lb.example.com"         # 负载均衡子域名
-PROXIED=false
-TTL=60
+PROXIED=false                       # Cloudflare 代理开关 (true=橙色云朵, 流量经CF; false=灰色, DNS直连)
+TTL=60                              # DNS 记录缓存时间 (秒), PROXIED=true 时此项无效
 
 # ──────────────────── 检测模式 ─────────────────────────────
 # ping   = ICMP Ping (需要 ping 命令)
@@ -30,6 +30,9 @@ MAX_LOSS=0             # 最高丢包率 (%)
 # ──────────────────── 安全阀 ──────────────────────────────
 SAFETY_ENABLED=true    # 是否启用安全阀 (true/false)
 SAFETY_THRESHOLD=20    # 可达率低于此百分比时中止同步, 防止误删 (%)
+
+# ──────────────────── 自动清理 ────────────────────────────
+AUTO_REMOVE_DEAD=false # 检测失败的目标自动从 IP 列表文件中删除 (true/false)
 
 # ──────────────────── 并发/日志 ────────────────────────────
 PARALLEL=10            # 同时检测多少个目标
@@ -395,6 +398,16 @@ main() {
     [ "$MAX_LATENCY" != "0" ] && gate_info="latency<=${MAX_LATENCY}ms"
     [ "$MAX_LOSS" != "0" ] && gate_info="${gate_info:+${gate_info} }loss<=${MAX_LOSS}%"
     [ -n "$gate_info" ] && log_info "  过滤: ${gate_info}"
+    if [ "$SAFETY_ENABLED" = "true" ]; then
+        log_info "  安全阀: 开启 (阈值${SAFETY_THRESHOLD}%)"
+    else
+        log_info "  安全阀: 关闭"
+    fi
+    if [ "$AUTO_REMOVE_DEAD" = "true" ]; then
+        log_info "  自动清理: 开启"
+    else
+        log_info "  自动清理: 关闭"
+    fi
     log_info "================================================="
 
     preflight_check
@@ -505,12 +518,32 @@ main() {
         done <<< "$cf_records"
     fi
 
+    # 自动清理: 从 IP 列表中删除检测失败的目标
+    local stat_cleaned=0
+    if [ "$AUTO_REMOVE_DEAD" = "true" ] && [ "$dead_count" -gt 0 ]; then
+        log_info "自动清理: 从 $IP_LIST 中移除不通的目标..."
+        for target in $target_list; do
+            local result
+            result=$(get_check_result "$target")
+            if [ "$result" = "dead" ]; then
+                local escaped
+                escaped=$(echo "$target" | sed 's/[.[\/*^$]/\\&/g')
+                sed -i.bak "/${escaped}/d" "$IP_LIST"
+                log_warn "  [x] CLEANED  $target"
+                stat_cleaned=$((stat_cleaned + 1))
+            fi
+        done
+        rm -f "${IP_LIST}.bak"
+        log_info "自动清理: 已移除 ${stat_cleaned} 个目标"
+    fi
+
     # 汇总
     log_info "-------- 同步汇总 --------"
     log_info "  目标总数:  $target_count"
     log_info "  存活:      $alive_count"
     log_info "  不通:      $dead_count"
     [ "$filtered_count" -gt 0 ] && log_info "  过滤:      $filtered_count"
+    [ "$stat_cleaned" -gt 0 ] && log_info "  已清理:    $stat_cleaned"
     log_info "  --------"
     log_info "  DNS IP数:  $unique_ip_count"
     log_info "  保持:      $stat_kept"

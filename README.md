@@ -31,7 +31,7 @@ Ping-DNSync/
 ### 1. 下载
 
 ```bash
-git clone https://github.com/你的用户名/Ping-DNSync.git
+git clone https://github.com/mintdesu/Ping-DNSync.git
 cd Ping-DNSync
 chmod +x ping-dnsync.sh
 ```
@@ -96,7 +96,22 @@ TCPing 模式需要 [pouriyajamshidi/tcping](https://github.com/pouriyajamshidi/
 | `ALIVE_THRESHOLD` | `4` | 至少成功 N 次才算存活 |
 | `MAX_LATENCY` | `0` | 最高平均延迟 ms (0=不过滤) |
 | `MAX_LOSS` | `0` | 最高丢包率 % (0=不过滤) |
+| `SAFETY_ENABLED` | `true` | 安全阀开关 (见下方说明) |
+| `SAFETY_THRESHOLD` | `20` | 安全阀可达率阈值 (%) |
 | `PARALLEL` | `10` | 并发检测数 |
+
+## 安全阀
+
+安全阀用于防止本机网络故障时误删所有 DNS 记录。当存活 IP 的比例低于阈值时，脚本会中止同步，不对 DNS 做任何改动。
+
+```bash
+SAFETY_ENABLED=true    # 开启安全阀
+SAFETY_THRESHOLD=20    # 可达率低于 20% 时中止
+```
+
+例如你有 50 个 IP，检测后只有 8 个能通 (16%)，低于 20% 阈值，脚本判定大概率是本机网络有问题而不是 IP 全挂了，直接中止退出。
+
+**什么时候该关掉：** 如果你的 IP 列表很少（比如只有 2-3 个），正常业务下就可能出现大部分不通的情况，这时安全阀会误拦，建议设为 `false`。
 
 ## 定时运行
 

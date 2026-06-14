@@ -27,6 +27,10 @@ ALIVE_THRESHOLD=4      # 至少成功 N 次才算存活
 MAX_LATENCY=0          # 最高平均延迟 (ms)
 MAX_LOSS=0             # 最高丢包率 (%)
 
+# ──────────────────── 安全阀 ──────────────────────────────
+SAFETY_ENABLED=true    # 是否启用安全阀 (true/false)
+SAFETY_THRESHOLD=20    # 可达率低于此百分比时中止同步, 防止误删 (%)
+
 # ──────────────────── 并发/日志 ────────────────────────────
 PARALLEL=10            # 同时检测多少个目标
 
@@ -438,9 +442,13 @@ main() {
     [ "$filtered_count" -gt 0 ] && log_info "质量过滤: ${filtered_count} 个未达标被排除"
 
     # 安全阀
-    local reachable=$((alive_count + filtered_count))
-    if [ "$target_count" -gt 10 ] && [ "$reachable" -lt $((target_count / 5)) ]; then
-        die "可达率过低 (${reachable}/${target_count})! 可能是本机网络故障"
+    if [ "$SAFETY_ENABLED" = "true" ]; then
+        local reachable=$((alive_count + filtered_count))
+        local threshold_count
+        threshold_count=$(awk "BEGIN { printf \"%d\", $target_count * $SAFETY_THRESHOLD / 100 }")
+        if [ "$reachable" -lt "$threshold_count" ]; then
+            die "可达率过低 (${reachable}/${target_count}, 阈值${SAFETY_THRESHOLD}%)! 可能是本机网络故障"
+        fi
     fi
 
     # 3. 获取 Cloudflare 现有记录

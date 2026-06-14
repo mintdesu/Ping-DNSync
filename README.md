@@ -1,12 +1,12 @@
 # Ping-DNSync
 
-基于 Ping / TCPing 检活的 Cloudflare DNS 自动同步工具。
+基于 Ping / TCPing / HTTPing 检活的 Cloudflare DNS 自动同步工具。
 
 从 IP 列表读取目标 → 并发检测存活 → 自动增删 Cloudflare DNS A 记录，实现简易的 DNS 负载均衡。
 
 ## 功能
 
-- **双模式** — ICMP Ping 或 TCP Ping，一个变量切换
+- **三模式** — ICMP Ping、TCP Ping、HTTP Ping，一个变量切换
 - **并发检测** — 可配置并发数，批量 IP 快速完成
 - **质量过滤** — 可选的延迟和丢包率门槛，不达标自动排除
 - **智能同步** — 只增删有变化的记录，保持不变的不动
@@ -19,6 +19,7 @@ Ping-DNSync/
 ├── ping-dnsync.sh        # 主脚本
 ├── ping_ip_list.txt      # Ping 模式 IP 列表
 ├── tcping_ip_list.txt    # TCPing 模式 IP 列表
+├── httping_ip_list.txt   # HTTPing 模式 IP 列表
 ├── tcping                # TCPing 二进制 (仅 tcping 模式需要)
 ├── LICENSE               # GPL-3.0
 ├── LICENSE-tcping        # tcping 许可证
@@ -64,6 +65,40 @@ SUBDOMAIN="lb.example.com"        # 负载均衡子域名
 8.8.8.8:53
 ```
 
+**HTTPing 模式** — 编辑 `httping_ip_list.txt`，每行一个 URL：
+
+```
+https://your.server.ip
+https://your.server.ip:8443
+http://your.server.ip
+http://your.server.ip:8080
+```
+
+不带端口时 https 默认 443，http 默认 80。
+
+#### 判定模式
+
+通过 `HTTPING_MODE` 控制什么样的 HTTP 响应算"存活"：
+
+| 模式 | 存活条件 | 适用场景 |
+|------|----------|----------|
+| `strict` | 仅 2xx | 要求服务完全正常响应（默认） |
+| `standard` | 2xx + 3xx | 允许重定向 |
+| `loose` | 任何 HTTP 响应 | 只要服务器有回应就算存活 |
+
+#### Host 头
+
+```bash
+HTTPING_HOST=""              # 留空: 不附带 Host 头
+HTTPING_HOST="example.com"   # 附带 Host: example.com
+```
+
+**为什么需要这个？** 很多服务器上同一个 IP 会托管多个网站（虚拟主机）。当你用 `https://1.2.3.4` 直接访问 IP 时，服务器不知道你想访问哪个网站，通常会返回 403、404 或者一个默认页面，而不是你期望的 200。
+
+设置 `HTTPING_HOST="example.com"` 后，请求会带上 `Host: example.com` 头，服务器就能正确路由到对应的网站并返回正常响应。
+
+**什么时候不需要设？** 如果每个 IP 上只有一个网站，或者你只关心服务器是否有响应（配合 `loose` 模式），就不用设。
+
 ### 4. 运行
 
 ```bash
@@ -77,9 +112,12 @@ bash ping-dnsync.sh
 ```bash
 CHECK_MODE="ping"      # ICMP Ping 模式, 读取 ping_ip_list.txt
 CHECK_MODE="tcping"    # TCP Ping 模式, 读取 tcping_ip_list.txt, 需要 tcping 二进制
+CHECK_MODE="httping"   # HTTP Ping 模式, 读取 httping_ip_list.txt, 需要 curl
 ```
 
 TCPing 模式需要 [pouriyajamshidi/tcping](https://github.com/pouriyajamshidi/tcping) 二进制在脚本同目录，仓库已自带amd64。其他架构请从 [Releases](https://github.com/pouriyajamshidi/tcping/releases) 下载替换。
+
+HTTPing 模式只需要 curl（一般系统自带）。
 
 ## 配置说明
 
@@ -90,7 +128,9 @@ TCPing 模式需要 [pouriyajamshidi/tcping](https://github.com/pouriyajamshidi/
 | `SUBDOMAIN` | - | 负载均衡子域名 |
 | `PROXIED` | `false` | Cloudflare 代理 (true=橙色云朵) |
 | `TTL` | `60` | DNS 记录 TTL (秒) |
-| `CHECK_MODE` | `ping` | 检测模式: `ping` 或 `tcping` |
+| `CHECK_MODE` | `ping` | 检测模式: `ping` / `tcping` / `httping` |
+| `HTTPING_MODE` | `strict` | HTTPing 判定模式: `strict` / `standard` / `loose` |
+| `HTTPING_HOST` | (空) | HTTPing 请求的 Host 头 (见下方说明) |
 | `CHECK_COUNT` | `5` | 每个目标发送探测次数 |
 | `CHECK_TIMEOUT` | `2` | 单次探测超时 (秒) |
 | `ALIVE_THRESHOLD` | `4` | 至少成功 N 次才算存活 |

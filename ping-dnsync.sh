@@ -13,8 +13,9 @@ PROXIED=false                       # Cloudflare 代理开关 (true=橙色云朵
 TTL=60                              # DNS 记录缓存时间 (秒), PROXIED=true 时此项无效
 
 # ──────────────────── 检测模式 ─────────────────────────────
-# ping   = ICMP Ping (需要 ping 命令)
-# tcping = TCP Ping  (需要 tcping 二进制, 放在脚本同目录)
+# ping    = ICMP Ping  (需要 ping 命令)
+# tcping  = TCP Ping   (需要 tcping 二进制, 放在脚本同目录)
+# httping = HTTP Ping  (需要 curl 命令)
 CHECK_MODE="ping"
 
 # ──────────────────── 检测参数 ─────────────────────────────
@@ -22,6 +23,13 @@ CHECK_COUNT=5          # 每个目标发送探测次数
 CHECK_TIMEOUT=2        # 单次探测超时 (秒)
 PING_DEADLINE=18       # ping 总时限 (秒, 仅 ping 模式)
 ALIVE_THRESHOLD=4      # 至少成功 N 次才算存活
+
+# ──────────────────── HTTPing 参数 (仅 httping 模式) ──────
+# strict   = 仅 2xx 算存活 (服务完全正常)
+# standard = 2xx + 3xx 算存活 (允许重定向)
+# loose    = 任何 HTTP 响应算存活 (只要服务器有回应)
+HTTPING_MODE="strict"
+HTTPING_HOST=""        # 请求时附带的 Host 头 (留空=不附带, 例: "example.com")
 
 # ──────────────────── 质量门槛 (0=不过滤) ─────────────────
 MAX_LATENCY=0          # 最高平均延迟 (ms)
@@ -51,11 +59,11 @@ PING_RESULT_DIR=""
 CF_ZONE_ID=""
 
 # 根据模式选择 IP 列表文件
-if [ "$CHECK_MODE" = "tcping" ]; then
-    IP_LIST="${SCRIPT_DIR}/tcping_ip_list.txt"
-else
-    IP_LIST="${SCRIPT_DIR}/ping_ip_list.txt"
-fi
+case "$CHECK_MODE" in
+    tcping)  IP_LIST="${SCRIPT_DIR}/tcping_ip_list.txt" ;;
+    httping) IP_LIST="${SCRIPT_DIR}/httping_ip_list.txt" ;;
+    *)       IP_LIST="${SCRIPT_DIR}/ping_ip_list.txt" ;;
+esac
 
 # ──────────────────── 工具函数 ────────────────────────────
 
@@ -107,14 +115,20 @@ preflight_check() {
     local missing=""
     command -v curl >/dev/null 2>&1 || missing="${missing} curl"
 
-    if [ "$CHECK_MODE" = "tcping" ]; then
-        if [ ! -f "$TCPING_BIN" ]; then
-            die "tcping 模式需要 tcping 二进制, 请放到 ${SCRIPT_DIR}/"
-        fi
-        [ -x "$TCPING_BIN" ] || chmod +x "$TCPING_BIN"
-    else
-        command -v ping >/dev/null 2>&1 || missing="${missing} ping"
-    fi
+    case "$CHECK_MODE" in
+        tcping)
+            if [ ! -f "$TCPING_BIN" ]; then
+                die "tcping 模式需要 tcping 二进制, 请放到 ${SCRIPT_DIR}/"
+            fi
+            [ -x "$TCPING_BIN" ] || chmod +x "$TCPING_BIN"
+            ;;
+        httping)
+            # httping 依赖 curl, 已在上面检查
+            ;;
+        *)
+            command -v ping >/dev/null 2>&1 || missing="${missing} ping"
+            ;;
+    esac
 
     [ -n "$missing" ] && die "缺少必要工具:${missing}"
     [ -f "$IP_LIST" ] || die "IP 列表不存在: $IP_LIST"
@@ -148,33 +162,42 @@ cf_lookup_zone_id() {
 # ──────────────────── IP/目标 提取 ────────────────────────
 
 extract_targets() {
-    if [ "$CHECK_MODE" = "tcping" ]; then
-        # tcping: 提取 ip:port 格式
-        grep -vE '^\s*(#|//|$)' "$IP_LIST" \
-            | grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}:[0-9]+' \
-            | sort -t: -k1,1 -k2,2n | uniq
-    else
-        # ping: 提取纯 IPv4
-        grep -vE '^\s*(#|//|$)' "$IP_LIST" \
-            | grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}' \
-            | while IFS='.' read -r a b c d; do
-                if [ "$a" -ge 0 ] 2>/dev/null && [ "$a" -le 255 ] && \
-                   [ "$b" -ge 0 ] 2>/dev/null && [ "$b" -le 255 ] && \
-                   [ "$c" -ge 0 ] 2>/dev/null && [ "$c" -le 255 ] && \
-                   [ "$d" -ge 0 ] 2>/dev/null && [ "$d" -le 255 ]; then
-                    local ip="${a}.${b}.${c}.${d}"
-                    [ "$ip" = "0.0.0.0" ] && continue
-                    [ "$ip" = "255.255.255.255" ] && continue
-                    echo "$ip"
-                fi
-            done \
-            | sort -t. -k1,1n -k2,2n -k3,3n -k4,4n | uniq
-    fi
+    case "$CHECK_MODE" in
+        tcping)
+            # tcping: 提取 ip:port 格式
+            grep -vE '^\s*(#|//|$)' "$IP_LIST" \
+                | grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}:[0-9]+' \
+                | sort -t: -k1,1 -k2,2n | uniq
+            ;;
+        httping)
+            # httping: 提取 http(s)://ip 或 http(s)://ip:port 格式
+            grep -vE '^\s*(#|//|$)' "$IP_LIST" \
+                | grep -oE 'https?://([0-9]{1,3}\.){3}[0-9]{1,3}(:[0-9]+)?' \
+                | sort -u
+            ;;
+        *)
+            # ping: 提取纯 IPv4
+            grep -vE '^\s*(#|//|$)' "$IP_LIST" \
+                | grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}' \
+                | while IFS='.' read -r a b c d; do
+                    if [ "$a" -ge 0 ] 2>/dev/null && [ "$a" -le 255 ] && \
+                       [ "$b" -ge 0 ] 2>/dev/null && [ "$b" -le 255 ] && \
+                       [ "$c" -ge 0 ] 2>/dev/null && [ "$c" -le 255 ] && \
+                       [ "$d" -ge 0 ] 2>/dev/null && [ "$d" -le 255 ]; then
+                        local ip="${a}.${b}.${c}.${d}"
+                        [ "$ip" = "0.0.0.0" ] && continue
+                        [ "$ip" = "255.255.255.255" ] && continue
+                        echo "$ip"
+                    fi
+                done \
+                | sort -t. -k1,1n -k2,2n -k3,3n -k4,4n | uniq
+            ;;
+    esac
 }
 
-# 从目标中提取纯 IP (去掉端口)
+# 从目标中提取纯 IP (去掉协议和端口)
 get_ip() {
-    echo "$1" | cut -d: -f1
+    echo "$1" | sed -E 's|https?://||' | sed 's|:[0-9]*$||'
 }
 
 # ──────────────────── 检测函数 ────────────────────────────
@@ -226,13 +249,59 @@ do_tcping() {
     echo "${status}|${CHECK_COUNT}|${ok_count}|${loss}|${avg_ms}" > "$result_file"
 }
 
+# HTTP Ping 检测
+do_httping() {
+    local target="$1" result_file="$2"
+    local ok_count=0 total_ms=0
+    local i
+
+    for i in $(seq 1 "$CHECK_COUNT"); do
+        local output
+        local curl_args=(-o /dev/null -s -w '%{http_code} %{time_total}'
+            --connect-timeout "$CHECK_TIMEOUT" -m "$CHECK_TIMEOUT" -k)
+        [ -n "$HTTPING_HOST" ] && curl_args+=(-H "Host: ${HTTPING_HOST}")
+        output=$(curl "${curl_args[@]}" "$target" 2>/dev/null)
+        local code time_s
+        code=$(echo "$output" | awk '{print $1}')
+        time_s=$(echo "$output" | awk '{print $2}')
+
+        local is_ok=false
+        if [ -n "$code" ] && [ "$code" -gt 0 ] 2>/dev/null; then
+            case "$HTTPING_MODE" in
+                strict)   [ "$code" -ge 200 ] && [ "$code" -lt 300 ] && is_ok=true ;;
+                loose)    is_ok=true ;;
+                *)        [ "$code" -ge 200 ] && [ "$code" -lt 400 ] && is_ok=true ;;
+            esac
+        fi
+        if [ "$is_ok" = "true" ]; then
+            ok_count=$((ok_count + 1))
+            local ms
+            ms=$(awk "BEGIN { printf \"%.3f\", $time_s * 1000 }")
+            total_ms=$(awk "BEGIN { printf \"%.3f\", $total_ms + $ms }")
+        fi
+    done
+
+    local loss
+    loss=$(awk "BEGIN { if ($CHECK_COUNT > 0) printf \"%.2f\", (1 - $ok_count/$CHECK_COUNT) * 100; else print \"100.00\" }")
+
+    local avg_ms="-"
+    if [ "$ok_count" -gt 0 ]; then
+        avg_ms=$(awk "BEGIN { printf \"%.3f\", $total_ms / $ok_count }")
+    fi
+
+    local status="dead"
+    [ "$ok_count" -ge "$ALIVE_THRESHOLD" ] && status="alive"
+
+    echo "${status}|${CHECK_COUNT}|${ok_count}|${loss}|${avg_ms}" > "$result_file"
+}
+
 # 分发到对应检测函数
 do_check() {
-    if [ "$CHECK_MODE" = "tcping" ]; then
-        do_tcping "$@"
-    else
-        do_ping "$@"
-    fi
+    case "$CHECK_MODE" in
+        tcping)  do_tcping "$@" ;;
+        httping) do_httping "$@" ;;
+        *)       do_ping "$@" ;;
+    esac
 }
 
 # ──────────────────── 表格输出 ────────────────────────────
@@ -254,6 +323,7 @@ parallel_check_all() {
 
     local mode_label="Ping"
     [ "$CHECK_MODE" = "tcping" ] && mode_label="TCPing"
+    [ "$CHECK_MODE" = "httping" ] && mode_label="HTTPing"
     log_info "开始并发 ${mode_label} 检测 (并发数: $PARALLEL)..."
 
     print_row "Target" "Sent" "Recv" "Loss%" "Avg(ms)"
@@ -390,6 +460,7 @@ main() {
 
     local mode_label="Ping"
     [ "$CHECK_MODE" = "tcping" ] && mode_label="TCPing"
+    [ "$CHECK_MODE" = "httping" ] && mode_label="HTTPing"
 
     log_info "================================================="
     log_info "  Ping-DNSync - ${mode_label} 模式"
@@ -398,6 +469,10 @@ main() {
     [ "$MAX_LATENCY" != "0" ] && gate_info="latency<=${MAX_LATENCY}ms"
     [ "$MAX_LOSS" != "0" ] && gate_info="${gate_info:+${gate_info} }loss<=${MAX_LOSS}%"
     [ -n "$gate_info" ] && log_info "  过滤: ${gate_info}"
+    if [ "$CHECK_MODE" = "httping" ]; then
+        log_info "  HTTPing 判定: ${HTTPING_MODE}"
+        [ -n "$HTTPING_HOST" ] && log_info "  HTTPing Host: ${HTTPING_HOST}"
+    fi
     if [ "$SAFETY_ENABLED" = "true" ]; then
         log_info "  安全阀: 开启 (阈值${SAFETY_THRESHOLD}%)"
     else

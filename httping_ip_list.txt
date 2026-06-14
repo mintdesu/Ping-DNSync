@@ -1,0 +1,6 @@
+# HTTPing IP List
+# Supported formats:
+#   https://1.1.1.1
+#   https://1.1.1.1:8443
+#   http://1.1.1.1
+#   http://1.1.1.1:8080

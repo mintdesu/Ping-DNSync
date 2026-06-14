@@ -68,10 +68,10 @@ SUBDOMAIN="lb.example.com"        # 负载均衡子域名
 **HTTPing 模式** — 编辑 `httping_ip_list.txt`，每行一个 URL：
 
 ```
-https://your.server.ip
-https://your.server.ip:8443
-http://your.server.ip
-http://your.server.ip:8080
+https://1.2.3.4
+https://5.6.7.8:8443
+http://1.2.3.4
+http://9.10.11.12:8080
 ```
 
 不带端口时 https 默认 443，http 默认 80。

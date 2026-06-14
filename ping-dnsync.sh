@@ -458,7 +458,7 @@ main() {
     if [ "$SAFETY_ENABLED" = "true" ]; then
         local reachable=$((alive_count + filtered_count))
         local threshold_count
-        threshold_count=$(awk "BEGIN { printf \"%d\", $target_count * $SAFETY_THRESHOLD / 100 }")
+        threshold_count=$(awk "BEGIN { v = $target_count * $SAFETY_THRESHOLD / 100; printf \"%d\", (v > int(v)) ? int(v)+1 : v }")
         if [ "$reachable" -lt "$threshold_count" ]; then
             die "可达率过低 (${reachable}/${target_count}, 阈值${SAFETY_THRESHOLD}%)! 可能是本机网络故障"
         fi

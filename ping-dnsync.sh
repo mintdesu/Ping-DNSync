@@ -24,6 +24,11 @@ CHECK_TIMEOUT=2        # 单次探测超时 (秒)
 PING_DEADLINE=18       # ping 总时限 (秒, 仅 ping 模式)
 ALIVE_THRESHOLD=4      # 至少成功 N 次才算存活
 
+# ──────────────────── 多端口判定 (tcping/httping) ─────────
+# or  = 同 IP 任一端口存活即算存活
+# and = 同 IP 所有端口都存活才算存活
+MULTI_PORT_LOGIC="or"
+
 # ──────────────────── HTTPing 参数 (仅 httping 模式) ──────
 # strict   = 仅 2xx 算存活 (服务完全正常)
 # standard = 2xx + 3xx 算存活 (允许重定向)
@@ -473,6 +478,9 @@ main() {
         log_info "  HTTPing 判定: ${HTTPING_MODE}"
         [ -n "$HTTPING_HOST" ] && log_info "  HTTPing Host: ${HTTPING_HOST}"
     fi
+    if [ "$CHECK_MODE" != "ping" ]; then
+        log_info "  多端口判定: ${MULTI_PORT_LOGIC}"
+    fi
     if [ "$SAFETY_ENABLED" = "true" ]; then
         log_info "  安全阀: 开启 (阈值${SAFETY_THRESHOLD}%)"
     else
@@ -505,6 +513,7 @@ main() {
     # 统计结果 & 构建存活 IP 列表 (去重)
     local alive_count=0 dead_count=0 filtered_count=0
     local alive_ips=""
+    local dead_ips=""
 
     for target in $target_list; do
         local result
@@ -515,16 +524,36 @@ main() {
         case "$result" in
             alive)
                 alive_count=$((alive_count + 1))
-                # 去重: 同一 IP 不同端口只记一次
                 if ! echo "$alive_ips" | grep -qx "$ip" 2>/dev/null; then
                     alive_ips="${alive_ips}${alive_ips:+
 }${ip}"
                 fi
                 ;;
             filtered) filtered_count=$((filtered_count + 1)) ;;
-            *)        dead_count=$((dead_count + 1)) ;;
+            *)
+                dead_count=$((dead_count + 1))
+                if ! echo "$dead_ips" | grep -qx "$ip" 2>/dev/null; then
+                    dead_ips="${dead_ips}${dead_ips:+
+}${ip}"
+                fi
+                ;;
         esac
     done
+
+    # AND 模式: 同 IP 有任一端口失败则移除该 IP
+    if [ "$MULTI_PORT_LOGIC" = "and" ] && [ -n "$dead_ips" ] && [ -n "$alive_ips" ]; then
+        local filtered_alive=""
+        while IFS= read -r ip; do
+            [ -z "$ip" ] && continue
+            if echo "$dead_ips" | grep -qx "$ip"; then
+                log_warn "AND 模式: $ip 部分端口不通, 整体判定为不存活"
+            else
+                filtered_alive="${filtered_alive}${filtered_alive:+
+}${ip}"
+            fi
+        done <<< "$alive_ips"
+        alive_ips="$filtered_alive"
+    fi
 
     log_info "结果: ${alive_count} 存活 / ${dead_count} 不通"
     [ "$filtered_count" -gt 0 ] && log_info "质量过滤: ${filtered_count} 个未达标被排除"

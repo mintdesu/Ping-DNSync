@@ -129,6 +129,7 @@ HTTPing 模式只需要 curl（一般系统自带）。
 | `PROXIED` | `false` | Cloudflare 代理 (true=橙色云朵) |
 | `TTL` | `60` | DNS 记录 TTL (秒) |
 | `CHECK_MODE` | `ping` | 检测模式: `ping` / `tcping` / `httping` |
+| `MULTI_PORT_LOGIC` | `or` | 同 IP 多端口判定: `or` / `and` (仅 tcping/httping) |
 | `HTTPING_MODE` | `strict` | HTTPing 判定模式: `strict` / `standard` / `loose` |
 | `HTTPING_HOST` | (空) | HTTPing 请求的 Host 头 (见下方说明) |
 | `CHECK_COUNT` | `5` | 每个目标发送探测次数 |
@@ -140,6 +141,24 @@ HTTPing 模式只需要 curl（一般系统自带）。
 | `SAFETY_THRESHOLD` | `20` | 安全阀可达率阈值 (%) |
 | `AUTO_REMOVE_DEAD` | `false` | 自动清理开关 (见下方说明) |
 | `PARALLEL` | `10` | 并发检测数 |
+
+## 多端口判定
+
+当 TCPing 或 HTTPing 列表中同一个 IP 出现了多个端口/协议时（例如 `1.1.1.1:443` 和 `1.1.1.1:80`），通过 `MULTI_PORT_LOGIC` 控制该 IP 的存活判定：
+
+```bash
+MULTI_PORT_LOGIC="or"    # 任一端口通就算活 (默认)
+MULTI_PORT_LOGIC="and"   # 所有端口都通才算活
+```
+
+**示例：** 假设列表中有 `1.1.1.1:443`（活）和 `1.1.1.1:80`（死）：
+
+| 模式 | 结果 | 原因 |
+|------|------|------|
+| `or` | 1.1.1.1 存活 | 443 端口通了就够 |
+| `and` | 1.1.1.1 不存活 | 80 端口不通，整体判死 |
+
+Ping 模式下此配置无效（Ping 没有端口概念）。
 
 ## 安全阀
 

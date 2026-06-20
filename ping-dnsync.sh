@@ -337,7 +337,7 @@ parallel_check_all() {
         (
             # 用 target 做文件名 (: 替换为 _)
             local safe_name
-            safe_name=$(echo "$target" | tr ':' '_')
+            safe_name=$(echo "$target" | tr ':/' '__')
             do_check "$target" "${PING_RESULT_DIR}/${safe_name}"
 
             local data
@@ -361,7 +361,7 @@ parallel_check_all() {
 get_check_result() {
     local target="$1"
     local safe_name
-    safe_name=$(echo "$target" | tr ':' '_')
+    safe_name=$(echo "$target" | tr ':/' '__')
     local data
     data=$(cat "${PING_RESULT_DIR}/${safe_name}" 2>/dev/null || echo "dead|0|0|100.00|-")
     local status loss avg_ms

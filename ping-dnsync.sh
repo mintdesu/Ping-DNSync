@@ -264,8 +264,17 @@ do_httping() {
         local output
         local curl_args=(-o /dev/null -s -w '%{http_code} %{time_total}'
             --connect-timeout "$CHECK_TIMEOUT" -m "$CHECK_TIMEOUT" -k)
-        [ -n "$HTTPING_HOST" ] && curl_args+=(-H "Host: ${HTTPING_HOST}")
-        output=$(curl "${curl_args[@]}" "$target" 2>/dev/null)
+        local curl_url="$target"
+        if [ -n "$HTTPING_HOST" ]; then
+            local ip port proto
+            ip=$(echo "$target" | sed -E 's|https?://||' | sed 's|:[0-9]*$||')
+            proto=$(echo "$target" | grep -oE '^https?')
+            port=$(echo "$target" | grep -oE ':[0-9]+$' | tr -d ':')
+            [ -z "$port" ] && { [ "$proto" = "https" ] && port=443 || port=80; }
+            curl_args+=(--resolve "${HTTPING_HOST}:${port}:${ip}")
+            curl_url="${proto}://${HTTPING_HOST}:${port}/"
+        fi
+        output=$(curl "${curl_args[@]}" "$curl_url" 2>/dev/null)
         local code time_s
         code=$(echo "$output" | awk '{print $1}')
         time_s=$(echo "$output" | awk '{print $2}')

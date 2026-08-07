@@ -591,30 +591,22 @@ main() {
         unique_ip_count=$(echo "$alive_ips" | grep -c . || echo 0)
         if [ "$unique_ip_count" -gt "$MAX_DNS_RECORDS" ]; then
             log_info "存活 IP (${unique_ip_count}) 超过上限 (${MAX_DNS_RECORDS}), 按延迟择优..."
-            local ip_latency_list=""
-            while IFS= read -r ip; do
-                [ -z "$ip" ] && continue
-                local best_latency="999999"
-                for target in $target_list; do
-                    local tip
-                    tip=$(get_ip "$target")
-                    [ "$tip" != "$ip" ] && continue
-                    local safe_name
-                    safe_name=$(echo "$target" | tr ':/' '__')
-                    local data
-                    data=$(cat "${PING_RESULT_DIR}/${safe_name}" 2>/dev/null || echo "dead|0|0|100.00|-")
-                    local avg_ms
-                    avg_ms=$(echo "$data" | cut -d'|' -f5)
-                    if [ "$avg_ms" != "-" ]; then
-                        local is_better
-                        is_better=$(awk "BEGIN { print ($avg_ms < $best_latency) }")
-                        [ "$is_better" = "1" ] && best_latency="$avg_ms"
-                    fi
-                done
-                ip_latency_list="${ip_latency_list}${ip_latency_list:+
-}${best_latency}|${ip}"
-            done <<< "$alive_ips"
-            alive_ips=$(echo "$ip_latency_list" | sort -t'|' -k1,1n | head -n "$MAX_DNS_RECORDS" | cut -d'|' -f2)
+            local ip_latency_pairs=""
+            for target in $target_list; do
+                local ip
+                ip=$(get_ip "$target")
+                echo "$alive_ips" | grep -qx "$ip" || continue
+                local safe_name
+                safe_name=$(echo "$target" | tr ':/' '__')
+                local result_file="${PING_RESULT_DIR}/${safe_name}"
+                [ -f "$result_file" ] || continue
+                local avg_ms
+                avg_ms=$(cut -d'|' -f5 < "$result_file")
+                [ "$avg_ms" = "-" ] && avg_ms="999999"
+                ip_latency_pairs="${ip_latency_pairs}${avg_ms} ${ip}
+"
+            done
+            alive_ips=$(printf '%s' "$ip_latency_pairs" | sort -k1,1n | awk '!seen[$2]++{print $2}' | head -n "$MAX_DNS_RECORDS")
             local trimmed=$((unique_ip_count - MAX_DNS_RECORDS))
             log_info "已截取延迟最低的 ${MAX_DNS_RECORDS} 个 IP, 排除 ${trimmed} 个"
         fi

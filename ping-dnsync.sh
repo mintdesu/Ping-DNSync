@@ -666,14 +666,24 @@ main() {
         done <<< "$cf_records"
     fi
 
-    # 自动清理: 从 IP 列表中删除检测失败的目标
+    # 自动清理: 从 IP 列表中删除不存活的目标
     local stat_cleaned=0
     if [ "$AUTO_REMOVE_DEAD" = "true" ] && [ "$dead_count" -gt 0 ]; then
         log_info "自动清理: 从 $IP_LIST 中移除不通的目标..."
         for target in $target_list; do
+            local should_clean=false
             local result
             result=$(get_check_result "$target")
             if [ "$result" = "dead" ]; then
+                should_clean=true
+            elif [ "$MULTI_PORT_LOGIC" = "and" ] && [ "$CHECK_MODE" != "ping" ]; then
+                local ip
+                ip=$(get_ip "$target")
+                if [ -z "$alive_ips" ] || ! echo "$alive_ips" | grep -qx "$ip"; then
+                    should_clean=true
+                fi
+            fi
+            if [ "$should_clean" = "true" ]; then
                 local escaped
                 escaped=$(echo "$target" | sed 's/[.[\/*^$]/\\&/g')
                 sed -i.bak "/${escaped}/d" "$IP_LIST"

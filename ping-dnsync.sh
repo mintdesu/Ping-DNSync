@@ -35,10 +35,14 @@ MULTI_PORT_LOGIC="or"
 # loose    = 任何 HTTP 响应算存活 (只要服务器有回应)
 HTTPING_MODE="strict"
 HTTPING_HOST=""        # 请求时附带的 Host 头 (留空=不附带, 例: "example.com")
+HTTPING_VERIFY_TLS=false  # TLS 证书验证 (true=验证, 证书无效判 dead; false=跳过验证)
 
 # ──────────────────── 质量门槛 (0=不过滤) ─────────────────
 MAX_LATENCY=0          # 最高平均延迟 (ms)
 MAX_LOSS=0             # 最高丢包率 (%)
+
+# ──────────────────── DNS 记录上限 ─────────────────────────
+MAX_DNS_RECORDS=0      # 最多同步多少条 A 记录 (0=不限制, 按延迟从低到高选取)
 
 # ──────────────────── 安全阀 ──────────────────────────────
 SAFETY_ENABLED=true    # 是否启用安全阀 (true/false)
@@ -263,7 +267,8 @@ do_httping() {
     for i in $(seq 1 "$CHECK_COUNT"); do
         local output
         local curl_args=(-o /dev/null -s -w '%{http_code} %{time_total}'
-            --connect-timeout "$CHECK_TIMEOUT" -m "$CHECK_TIMEOUT" -k)
+            --connect-timeout "$CHECK_TIMEOUT" -m "$CHECK_TIMEOUT")
+        [ "$HTTPING_VERIFY_TLS" != "true" ] && curl_args+=(-k)
         local curl_url="$target"
         if [ -n "$HTTPING_HOST" ]; then
             local ip port proto
@@ -486,9 +491,13 @@ main() {
     if [ "$CHECK_MODE" = "httping" ]; then
         log_info "  HTTPing 判定: ${HTTPING_MODE}"
         [ -n "$HTTPING_HOST" ] && log_info "  HTTPing Host: ${HTTPING_HOST}"
+        [ "$HTTPING_VERIFY_TLS" = "true" ] && log_info "  TLS 验证: 开启"
     fi
     if [ "$CHECK_MODE" != "ping" ]; then
         log_info "  多端口判定: ${MULTI_PORT_LOGIC}"
+    fi
+    if [ "$MAX_DNS_RECORDS" != "0" ] && [ "$MAX_DNS_RECORDS" -gt 0 ] 2>/dev/null; then
+        log_info "  DNS 上限: ${MAX_DNS_RECORDS} 条 (按延迟择优)"
     fi
     if [ "$SAFETY_ENABLED" = "true" ]; then
         log_info "  安全阀: 开启 (阈值${SAFETY_THRESHOLD}%)"
@@ -574,6 +583,40 @@ main() {
         threshold_count=$(awk "BEGIN { v = $target_count * $SAFETY_THRESHOLD / 100; printf \"%d\", (v > int(v)) ? int(v)+1 : v }")
         if [ "$reachable" -lt "$threshold_count" ]; then
             die "可达率过低 (${reachable}/${target_count}, 阈值${SAFETY_THRESHOLD}%)! 可能是本机网络故障"
+        fi
+    fi
+
+    # DNS 记录上限: 按延迟排序截取前 N 个
+    if [ "$MAX_DNS_RECORDS" != "0" ] && [ "$MAX_DNS_RECORDS" -gt 0 ] 2>/dev/null && [ -n "$alive_ips" ]; then
+        unique_ip_count=$(echo "$alive_ips" | grep -c . || echo 0)
+        if [ "$unique_ip_count" -gt "$MAX_DNS_RECORDS" ]; then
+            log_info "存活 IP (${unique_ip_count}) 超过上限 (${MAX_DNS_RECORDS}), 按延迟择优..."
+            local ip_latency_list=""
+            while IFS= read -r ip; do
+                [ -z "$ip" ] && continue
+                local best_latency="999999"
+                for target in $target_list; do
+                    local tip
+                    tip=$(get_ip "$target")
+                    [ "$tip" != "$ip" ] && continue
+                    local safe_name
+                    safe_name=$(echo "$target" | tr ':/' '__')
+                    local data
+                    data=$(cat "${PING_RESULT_DIR}/${safe_name}" 2>/dev/null || echo "dead|0|0|100.00|-")
+                    local avg_ms
+                    avg_ms=$(echo "$data" | cut -d'|' -f5)
+                    if [ "$avg_ms" != "-" ]; then
+                        local is_better
+                        is_better=$(awk "BEGIN { print ($avg_ms < $best_latency) }")
+                        [ "$is_better" = "1" ] && best_latency="$avg_ms"
+                    fi
+                done
+                ip_latency_list="${ip_latency_list}${ip_latency_list:+
+}${best_latency}|${ip}"
+            done <<< "$alive_ips"
+            alive_ips=$(echo "$ip_latency_list" | sort -t'|' -k1,1n | head -n "$MAX_DNS_RECORDS" | cut -d'|' -f2)
+            local trimmed=$((unique_ip_count - MAX_DNS_RECORDS))
+            log_info "已截取延迟最低的 ${MAX_DNS_RECORDS} 个 IP, 排除 ${trimmed} 个"
         fi
     fi
 

@@ -99,6 +99,17 @@ HTTPING_HOST="example.com"   # 附带 Host: example.com
 
 **什么时候不需要设？** 如果每个 IP 上只有一个网站，或者你只关心服务器是否有响应（配合 `loose` 模式），就不用设。
 
+#### TLS 证书验证
+
+```bash
+HTTPING_VERIFY_TLS=false   # 跳过验证 (默认)
+HTTPING_VERIFY_TLS=true    # 开启验证, 证书无效直接判 dead
+```
+
+默认跳过 TLS 验证（`curl -k`）。开启后，证书过期、域名不匹配、自签名等 TLS 错误会导致请求失败，该 IP 被判定为不存活。
+
+适合使用第三方 CF 反代 IP 的场景——TLS 握手失败的 IP 即使端口通了用户也访问不了，应该直接排除。
+
 ### 4. 运行
 
 ```bash
@@ -132,11 +143,13 @@ HTTPing 模式只需要 curl（一般系统自带）。
 | `MULTI_PORT_LOGIC` | `or` | 同 IP 多端口判定: `or` / `and` (仅 tcping/httping) |
 | `HTTPING_MODE` | `strict` | HTTPing 判定模式: `strict` / `standard` / `loose` |
 | `HTTPING_HOST` | (空) | HTTPing 请求的 Host 头 (见下方说明) |
+| `HTTPING_VERIFY_TLS` | `false` | TLS 证书验证 (true=证书无效判 dead) |
 | `CHECK_COUNT` | `5` | 每个目标发送探测次数 |
 | `CHECK_TIMEOUT` | `2` | 单次探测超时 (秒) |
 | `ALIVE_THRESHOLD` | `4` | 至少成功 N 次才算存活 |
 | `MAX_LATENCY` | `0` | 最高平均延迟 ms (0=不过滤) |
 | `MAX_LOSS` | `0` | 最高丢包率 % (0=不过滤) |
+| `MAX_DNS_RECORDS` | `0` | 最多同步的 A 记录数 (0=不限制, 按延迟择优) |
 | `SAFETY_ENABLED` | `true` | 安全阀开关 (见下方说明) |
 | `SAFETY_THRESHOLD` | `20` | 安全阀可达率阈值 (%) |
 | `AUTO_REMOVE_DEAD` | `false` | 自动清理开关 (见下方说明) |
@@ -159,6 +172,17 @@ MULTI_PORT_LOGIC="and"   # 所有端口都通才算活
 | `and` | 1.1.1.1 不存活 | 80 端口不通，整体判死 |
 
 Ping 模式下此配置无效（Ping 没有端口概念）。
+
+## DNS 记录上限
+
+当存活 IP 数量很多时，全部写入 DNS 没有必要。设置 `MAX_DNS_RECORDS` 可以限制最终同步的 A 记录数量，脚本会按平均延迟从低到高排序，只保留最优的前 N 个。
+
+```bash
+MAX_DNS_RECORDS=0     # 不限制，全部同步 (默认)
+MAX_DNS_RECORDS=10    # 最多同步 10 条，按延迟选最优
+```
+
+多端口场景下，同一 IP 的多个端口取最低延迟作为该 IP 的排序依据。
 
 ## 安全阀
 

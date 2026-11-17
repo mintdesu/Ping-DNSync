@@ -1,7 +1,7 @@
 #!/bin/bash
 # ============================================================================
 #  Ping-DNSync
-#  基于 Ping/TCPing 检活的 Cloudflare DNS 自动同步工具
+#  基于 Ping/TCPing/HTTPing 检活的 Cloudflare DNS 自动同步工具
 #  依赖: bash / curl / ping (ping模式) 或 tcping二进制 (tcping模式)
 # ============================================================================
 
@@ -34,8 +34,10 @@ MULTI_PORT_LOGIC="or"
 # standard = 2xx + 3xx 算存活 (允许重定向)
 # loose    = 任何 HTTP 响应算存活 (只要服务器有回应)
 HTTPING_MODE="strict"
-HTTPING_HOST=""        # 请求时附带的 Host 头 (留空=不附带, 例: "example.com")
-HTTPING_VERIFY_TLS=false  # TLS 证书验证 (true=验证, 证书无效判 dead; false=跳过验证)
+HTTPING_HOST=""        # 访问用的域名, 同时作为 Host 头和 TLS SNI (留空=直接访问 IP, 例: "example.com")
+HTTPING_VERIFY_TLS=false  # TLS 证书验证 (true=证书域名不符/过期/不受信任判 dead; false=跳过验证)
+                          # 开启且 HTTPING_HOST 留空时, https 目标用 SUBDOMAIN 作为 SNI 校验
+HTTPING_CA_FILE=""     # 自定义 CA 证书文件 (留空=系统 CA; 源站用 Cloudflare Origin 证书等非公开 CA 时填写)
 
 # ──────────────────── 质量门槛 (0=不过滤) ─────────────────
 MAX_LATENCY=0          # 最高平均延迟 (ms)
@@ -66,6 +68,7 @@ LOCK_FILE="${DATA_DIR}/.sync.lock"
 LOCK_OWNED=false
 PING_RESULT_DIR=""
 CF_ZONE_ID=""
+CLEANED_COUNT=0
 
 # 根据模式选择 IP 列表文件
 case "$CHECK_MODE" in
@@ -133,6 +136,14 @@ preflight_check() {
             ;;
         httping)
             # httping 依赖 curl, 已在上面检查
+            if [ "$HTTPING_VERIFY_TLS" = "true" ]; then
+                if [ -z "$HTTPING_HOST" ] && [ -z "$SUBDOMAIN" ]; then
+                    die "HTTPING_VERIFY_TLS 需要 HTTPING_HOST 或 SUBDOMAIN"
+                fi
+                if [ -n "$HTTPING_CA_FILE" ] && [ ! -f "$HTTPING_CA_FILE" ]; then
+                    die "HTTPING_CA_FILE 不存在: $HTTPING_CA_FILE"
+                fi
+            fi
             ;;
         *)
             command -v ping >/dev/null 2>&1 || missing="${missing} ping"
@@ -170,24 +181,23 @@ cf_lookup_zone_id() {
 
 # ──────────────────── IP/目标 提取 ────────────────────────
 
-extract_targets() {
+# 注释行/空行: 以 # 或 // 开头, 或全是空白
+COMMENT_RE='^[[:space:]]*(#|//|$)'
+
+# 从 stdin 解析目标 (不过滤注释, 不排序), 每行输出一个目标
+parse_targets() {
     case "$CHECK_MODE" in
         tcping)
             # tcping: 提取 ip:port 格式
-            grep -vE '^\s*(#|//|$)' "$IP_LIST" \
-                | grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}:[0-9]+' \
-                | sort -t: -k1,1 -k2,2n | uniq
+            grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}:[0-9]+'
             ;;
         httping)
             # httping: 提取 http(s)://ip 或 http(s)://ip:port 格式
-            grep -vE '^\s*(#|//|$)' "$IP_LIST" \
-                | grep -oE 'https?://([0-9]{1,3}\.){3}[0-9]{1,3}(:[0-9]+)?' \
-                | sort -u
+            grep -oE 'https?://([0-9]{1,3}\.){3}[0-9]{1,3}(:[0-9]+)?'
             ;;
         *)
             # ping: 提取纯 IPv4
-            grep -vE '^\s*(#|//|$)' "$IP_LIST" \
-                | grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}' \
+            grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}' \
                 | while IFS='.' read -r a b c d; do
                     if [ "$a" -ge 0 ] 2>/dev/null && [ "$a" -le 255 ] && \
                        [ "$b" -ge 0 ] 2>/dev/null && [ "$b" -le 255 ] && \
@@ -198,10 +208,62 @@ extract_targets() {
                         [ "$ip" = "255.255.255.255" ] && continue
                         echo "$ip"
                     fi
-                done \
-                | sort -t. -k1,1n -k2,2n -k3,3n -k4,4n | uniq
+                done
             ;;
     esac
+}
+
+extract_targets() {
+    local targets
+    targets=$(grep -vE "$COMMENT_RE" "$IP_LIST" | parse_targets)
+    [ -z "$targets" ] && return 0
+    case "$CHECK_MODE" in
+        tcping)  printf '%s\n' "$targets" | sort -t: -k1,1 -k2,2n | uniq ;;
+        httping) printf '%s\n' "$targets" | sort -u ;;
+        *)       printf '%s\n' "$targets" | sort -t. -k1,1n -k2,2n -k3,3n -k4,4n | uniq ;;
+    esac
+}
+
+# 从 IP 列表文件中删除指定目标
+# 逐行解析, 只有当一行解析出的目标全部在删除列表中 (精确匹配) 时才删除该行
+# 注释行/空行/解析不出目标的行原样保留
+remove_dead_targets() {
+    local dead_list="$1"
+    local tmp
+    tmp=$(mktemp "${DATA_DIR}/ip_list.XXXXXX") || { log_error "自动清理: 无法创建临时文件"; return 1; }
+
+    local line removed=0
+    while IFS= read -r line || [ -n "$line" ]; do
+        if printf '%s\n' "$line" | grep -qE "$COMMENT_RE"; then
+            printf '%s\n' "$line" >> "$tmp"
+            continue
+        fi
+
+        local line_targets t all_dead=true
+        line_targets=$(printf '%s\n' "$line" | parse_targets)
+        if [ -z "$line_targets" ]; then
+            printf '%s\n' "$line" >> "$tmp"
+            continue
+        fi
+        for t in $line_targets; do
+            if ! printf '%s\n' "$dead_list" | grep -qxF -- "$t"; then
+                all_dead=false
+                break
+            fi
+        done
+
+        if [ "$all_dead" = "true" ]; then
+            log_warn "  [x] CLEANED  $line"
+            removed=$((removed + 1))
+        else
+            printf '%s\n' "$line" >> "$tmp"
+        fi
+    done < "$IP_LIST"
+
+    # 用 cat 覆盖而不是 mv, 保留原文件的权限和属主
+    cat "$tmp" > "$IP_LIST"
+    rm -f "$tmp"
+    CLEANED_COUNT=$removed
 }
 
 # 从目标中提取纯 IP (去掉协议和端口)
@@ -261,25 +323,45 @@ do_tcping() {
 # HTTP Ping 检测
 do_httping() {
     local target="$1" result_file="$2"
-    local ok_count=0 total_ms=0
+    local ok_count=0 total_ms=0 tls_errors=0
     local i
 
+    # curl 参数只构造一次
+    local curl_args=(-o /dev/null -s -w '%{http_code} %{time_total}'
+        --connect-timeout "$CHECK_TIMEOUT" -m "$CHECK_TIMEOUT")
+    local ip port proto
+    ip=$(get_ip "$target")
+    proto=$(echo "$target" | grep -oE '^https?')
+    port=$(echo "$target" | grep -oE ':[0-9]+$' | tr -d ':')
+    [ -z "$port" ] && { [ "$proto" = "https" ] && port=443 || port=80; }
+
+    # 访问用的域名 (Host + SNI); 开启证书校验但未设置时, https 目标回退到 SUBDOMAIN
+    local domain="$HTTPING_HOST"
+    if [ -z "$domain" ] && [ "$proto" = "https" ] && [ "$HTTPING_VERIFY_TLS" = "true" ]; then
+        domain="$SUBDOMAIN"
+    fi
+
+    local curl_url="$target"
+    if [ -n "$domain" ]; then
+        # 用域名访问 (发送 SNI, 按域名校验证书), 但连接固定打到该 IP
+        curl_args+=(--resolve "${domain}:${port}:${ip}")
+        curl_url="${proto}://${domain}:${port}/"
+    fi
+    if [ "$HTTPING_VERIFY_TLS" = "true" ]; then
+        [ -n "$HTTPING_CA_FILE" ] && curl_args+=(--cacert "$HTTPING_CA_FILE")
+    else
+        curl_args+=(-k)
+    fi
+
     for i in $(seq 1 "$CHECK_COUNT"); do
-        local output
-        local curl_args=(-o /dev/null -s -w '%{http_code} %{time_total}'
-            --connect-timeout "$CHECK_TIMEOUT" -m "$CHECK_TIMEOUT")
-        [ "$HTTPING_VERIFY_TLS" != "true" ] && curl_args+=(-k)
-        local curl_url="$target"
-        if [ -n "$HTTPING_HOST" ]; then
-            local ip port proto
-            ip=$(echo "$target" | sed -E 's|https?://||' | sed 's|:[0-9]*$||')
-            proto=$(echo "$target" | grep -oE '^https?')
-            port=$(echo "$target" | grep -oE ':[0-9]+$' | tr -d ':')
-            [ -z "$port" ] && { [ "$proto" = "https" ] && port=443 || port=80; }
-            curl_args+=(--resolve "${HTTPING_HOST}:${port}:${ip}")
-            curl_url="${proto}://${HTTPING_HOST}:${port}/"
-        fi
+        local output rc
         output=$(curl "${curl_args[@]}" "$curl_url" 2>/dev/null)
+        rc=$?
+        # 51/60 = 证书校验失败 (域名不匹配 / 不受信任 / 已过期)
+        if [ "$rc" -eq 60 ] || [ "$rc" -eq 51 ]; then
+            tls_errors=$((tls_errors + 1))
+            continue
+        fi
         local code time_s
         code=$(echo "$output" | awk '{print $1}')
         time_s=$(echo "$output" | awk '{print $2}')
@@ -311,7 +393,10 @@ do_httping() {
     local status="dead"
     [ "$ok_count" -ge "$ALIVE_THRESHOLD" ] && status="alive"
 
-    echo "${status}|${CHECK_COUNT}|${ok_count}|${loss}|${avg_ms}" > "$result_file"
+    local note=""
+    [ "$tls_errors" -gt 0 ] && note="证书校验失败x${tls_errors}"
+
+    echo "${status}|${CHECK_COUNT}|${ok_count}|${loss}|${avg_ms}|${note}" > "$result_file"
 }
 
 # 分发到对应检测函数
@@ -326,14 +411,20 @@ do_check() {
 # ──────────────────── 表格输出 ────────────────────────────
 
 print_row() {
-    local target="$1" sent="$2" recv="$3" loss="$4" avg="$5"
+    local target="$1" sent="$2" recv="$3" loss="$4" avg="$5" note="$6"
     local line
-    line=$(printf '  %-24s %-8s %-8s %-8s %s' "$target" "$sent" "$recv" "$loss" "$avg")
+    line=$(printf '  %-24s %-8s %-8s %-8s %-10s %s' "$target" "$sent" "$recv" "$loss" "$avg" "$note")
+    line="${line%"${line##*[! ]}"}"   # 去掉行尾空格
     echo "$line"
     echo "$line" >> "$LOG_FILE"
 }
 
 # ──────────────────── 并发检测 ────────────────────────────
+
+# 目标对应的结果文件路径 (: 和 / 都替换为 _, 否则 https://ip 会变成子目录路径)
+result_file() {
+    echo "${PING_RESULT_DIR}/$(printf '%s' "$1" | tr ':/' '__')"
+}
 
 parallel_check_all() {
     local targets="$1"
@@ -345,19 +436,18 @@ parallel_check_all() {
     [ "$CHECK_MODE" = "httping" ] && mode_label="HTTPing"
     log_info "开始并发 ${mode_label} 检测 (并发数: $PARALLEL)..."
 
-    print_row "Target" "Sent" "Recv" "Loss%" "Avg(ms)"
+    print_row "Target" "Sent" "Recv" "Loss%" "Avg(ms)" "Note"
 
     for target in $targets; do
         (
-            # 用 target 做文件名 (: 替换为 _)
-            local safe_name
-            safe_name=$(echo "$target" | tr ':/' '__')
-            do_check "$target" "${PING_RESULT_DIR}/${safe_name}"
+            local rfile
+            rfile=$(result_file "$target")
+            do_check "$target" "$rfile"
 
             local data
-            data=$(cat "${PING_RESULT_DIR}/${safe_name}" 2>/dev/null)
-            IFS='|' read -r _status sent recv loss avg <<< "$data"
-            print_row "$target" "$sent" "$recv" "$loss" "$avg"
+            data=$(cat "$rfile" 2>/dev/null)
+            IFS='|' read -r _status sent recv loss avg note <<< "$data"
+            print_row "$target" "$sent" "$recv" "$loss" "$avg" "$note"
         ) &
 
         running=$((running + 1))
@@ -374,10 +464,8 @@ parallel_check_all() {
 # 读取检测结果 (返回 alive/dead/filtered)
 get_check_result() {
     local target="$1"
-    local safe_name
-    safe_name=$(echo "$target" | tr ':/' '__')
     local data
-    data=$(cat "${PING_RESULT_DIR}/${safe_name}" 2>/dev/null || echo "dead|0|0|100.00|-")
+    data=$(cat "$(result_file "$target")" 2>/dev/null || echo "dead|0|0|100.00|-")
     local status loss avg_ms
     status=$(echo "$data" | cut -d'|' -f1)
     loss=$(echo "$data" | cut -d'|' -f4)
@@ -491,7 +579,7 @@ main() {
     if [ "$CHECK_MODE" = "httping" ]; then
         log_info "  HTTPing 判定: ${HTTPING_MODE}"
         [ -n "$HTTPING_HOST" ] && log_info "  HTTPing Host: ${HTTPING_HOST}"
-        [ "$HTTPING_VERIFY_TLS" = "true" ] && log_info "  TLS 验证: 开启"
+        [ "$HTTPING_VERIFY_TLS" = "true" ] && log_info "  TLS 验证: 开启 (校验域名: ${HTTPING_HOST:-$SUBDOMAIN})"
     fi
     if [ "$CHECK_MODE" != "ping" ]; then
         log_info "  多端口判定: ${MULTI_PORT_LOGIC}"
@@ -520,8 +608,9 @@ main() {
     local target_list
     target_list=$(extract_targets)
     local target_count
-    target_count=$(echo "$target_list" | grep -c . || echo 0)
-    [ "$target_count" -eq 0 ] && die "未提取到有效目标"
+    # grep -c 无匹配时会输出 0 并返回 1, 用 || true 避免再追加一个 0
+    target_count=$(printf '%s\n' "$target_list" | grep -c . || true)
+    [ "${target_count:-0}" -eq 0 ] && die "未提取到有效目标, 请检查 $IP_LIST 的内容和格式"
     log_info "提取到 $target_count 个目标"
 
     # 2. 并发检测
@@ -559,12 +648,16 @@ main() {
     done
 
     # AND 模式: 同 IP 有任一端口失败则移除该 IP
+    # and_rejected_ips 单独记录, 供自动清理使用 (不能用 alive_ips 反推, 它之后还会被 DNS 上限截断)
+    local and_rejected_ips=""
     if [ "$MULTI_PORT_LOGIC" = "and" ] && [ -n "$dead_ips" ] && [ -n "$alive_ips" ]; then
         local filtered_alive=""
         while IFS= read -r ip; do
             [ -z "$ip" ] && continue
             if echo "$dead_ips" | grep -qx "$ip"; then
                 log_warn "AND 模式: $ip 部分端口不通, 整体判定为不存活"
+                and_rejected_ips="${and_rejected_ips}${and_rejected_ips:+
+}${ip}"
             else
                 filtered_alive="${filtered_alive}${filtered_alive:+
 }${ip}"
@@ -588,7 +681,7 @@ main() {
 
     # DNS 记录上限: 按延迟排序截取前 N 个
     if [ "$MAX_DNS_RECORDS" != "0" ] && [ "$MAX_DNS_RECORDS" -gt 0 ] 2>/dev/null && [ -n "$alive_ips" ]; then
-        unique_ip_count=$(echo "$alive_ips" | grep -c . || echo 0)
+        unique_ip_count=$(printf '%s\n' "$alive_ips" | grep -c . || true)
         if [ "$unique_ip_count" -gt "$MAX_DNS_RECORDS" ]; then
             log_info "存活 IP (${unique_ip_count}) 超过上限 (${MAX_DNS_RECORDS}), 按延迟择优..."
             local ip_latency_pairs=""
@@ -596,12 +689,11 @@ main() {
                 local ip
                 ip=$(get_ip "$target")
                 echo "$alive_ips" | grep -qx "$ip" || continue
-                local safe_name
-                safe_name=$(echo "$target" | tr ':/' '__')
-                local result_file="${PING_RESULT_DIR}/${safe_name}"
-                [ -f "$result_file" ] || continue
+                local rfile
+                rfile=$(result_file "$target")
+                [ -f "$rfile" ] || continue
                 local avg_ms
-                avg_ms=$(cut -d'|' -f5 < "$result_file")
+                avg_ms=$(cut -d'|' -f5 < "$rfile")
                 [ "$avg_ms" = "-" ] && avg_ms="999999"
                 ip_latency_pairs="${ip_latency_pairs}${avg_ms} ${ip}
 "
@@ -620,7 +712,7 @@ main() {
         die "获取 DNS 记录失败"
     fi
     local cf_count
-    cf_count=$(echo "$cf_records" | grep -c '|' 2>/dev/null || echo 0)
+    cf_count=$(printf '%s\n' "$cf_records" | grep -c '|' || true)
     log_info "现有 ${cf_count} 条 A 记录"
 
     # 4. 同步 DNS
@@ -630,7 +722,7 @@ main() {
 
     # 处理存活 IP
     if [ -n "$alive_ips" ]; then
-        unique_ip_count=$(echo "$alive_ips" | grep -c . || echo 0)
+        unique_ip_count=$(printf '%s\n' "$alive_ips" | grep -c . || true)
         while IFS= read -r ip; do
             [ -z "$ip" ] && continue
             if echo "$cf_records" | grep -q "|${ip}$"; then
@@ -670,29 +762,25 @@ main() {
     local stat_cleaned=0
     if [ "$AUTO_REMOVE_DEAD" = "true" ] && [ "$dead_count" -gt 0 ]; then
         log_info "自动清理: 从 $IP_LIST 中移除不通的目标..."
+        local clean_targets=""
         for target in $target_list; do
             local should_clean=false
-            local result
-            result=$(get_check_result "$target")
-            if [ "$result" = "dead" ]; then
+            if [ "$(get_check_result "$target")" = "dead" ]; then
                 should_clean=true
-            elif [ "$MULTI_PORT_LOGIC" = "and" ] && [ "$CHECK_MODE" != "ping" ]; then
-                local ip
-                ip=$(get_ip "$target")
-                if [ -z "$alive_ips" ] || ! echo "$alive_ips" | grep -qx "$ip"; then
-                    should_clean=true
-                fi
+            elif [ -n "$and_rejected_ips" ] && \
+                 printf '%s\n' "$and_rejected_ips" | grep -qxF -- "$(get_ip "$target")"; then
+                # AND 模式下被整体判死的 IP, 其存活端口也一并清理
+                should_clean=true
             fi
             if [ "$should_clean" = "true" ]; then
-                local escaped
-                escaped=$(echo "$target" | sed 's/[.[\/*^$]/\\&/g')
-                sed -i.bak "/${escaped}/d" "$IP_LIST"
-                log_warn "  [x] CLEANED  $target"
-                stat_cleaned=$((stat_cleaned + 1))
+                clean_targets="${clean_targets}${clean_targets:+
+}${target}"
             fi
         done
-        rm -f "${IP_LIST}.bak"
-        log_info "自动清理: 已移除 ${stat_cleaned} 个目标"
+        if remove_dead_targets "$clean_targets"; then
+            stat_cleaned=$CLEANED_COUNT
+        fi
+        log_info "自动清理: 已移除 ${stat_cleaned} 行"
     fi
 
     # 汇总

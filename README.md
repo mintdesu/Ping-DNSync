@@ -95,7 +95,7 @@ HTTPING_HOST="example.com"   # 附带 Host: example.com
 
 **为什么需要这个？** 很多服务器上同一个 IP 会托管多个网站（虚拟主机）。当你用 `https://1.2.3.4` 直接访问 IP 时，服务器不知道你想访问哪个网站，通常会返回 403、404 或者一个默认页面，而不是你期望的 200。
 
-设置 `HTTPING_HOST="example.com"` 后，请求会带上 `Host: example.com` 头，服务器就能正确路由到对应的网站并返回正常响应。
+设置 `HTTPING_HOST="example.com"` 后，请求会带上 `Host: example.com` 头，https 握手时也会以 `example.com` 作为 SNI（等同于 `curl --resolve example.com:443:1.2.3.4 https://example.com/`），服务器就能返回正确的证书并路由到对应的网站。很多服务（包括 Cloudflare）不带 SNI 会直接拒绝握手。
 
 **什么时候不需要设？** 如果每个 IP 上只有一个网站，或者你只关心服务器是否有响应（配合 `loose` 模式），就不用设。
 
@@ -104,11 +104,16 @@ HTTPING_HOST="example.com"   # 附带 Host: example.com
 ```bash
 HTTPING_VERIFY_TLS=false   # 跳过验证 (默认)
 HTTPING_VERIFY_TLS=true    # 开启验证, 证书无效直接判 dead
+HTTPING_CA_FILE=""         # 自定义 CA 文件 (留空=系统 CA)
 ```
 
-默认跳过 TLS 验证（`curl -k`）。开启后，证书过期、域名不匹配、自签名等 TLS 错误会导致请求失败，该 IP 被判定为不存活。
+默认跳过 TLS 验证（`curl -k`）。开启后，证书过期、域名不匹配、自签名等 TLS 错误会导致请求失败，该 IP 被判定为不存活。证书按 `HTTPING_HOST` 校验；`HTTPING_HOST` 留空时，https 目标自动使用 `SUBDOMAIN` 作为 SNI 和校验域名。
 
-适合使用第三方 CF 反代 IP 的场景——TLS 握手失败的 IP 即使端口通了用户也访问不了，应该直接排除。
+适合使用第三方 CF 反代 IP 的场景——有些反代 IP 会把请求转到别人的服务器上，返回别人网站的证书（例如 `*.example.org`），用户用你的域名访问时浏览器会报证书错误，应该直接排除。检测表的 Note 列会显示 `证书校验失败xN`，方便区分是证书问题还是连接问题。
+
+**提示：**
+- 反代的是 Cloudflare 时，正常 IP 返回的是 Cloudflare 签发的边缘证书 (Universal SSL)，域名对得上就会通过。
+- 源站用的是 Cloudflare Origin 证书、自签证书等非公开 CA 时，把对应 CA 证书填到 `HTTPING_CA_FILE`。
 
 ### 4. 运行
 
@@ -142,8 +147,9 @@ HTTPing 模式只需要 curl（一般系统自带）。
 | `CHECK_MODE` | `ping` | 检测模式: `ping` / `tcping` / `httping` |
 | `MULTI_PORT_LOGIC` | `or` | 同 IP 多端口判定: `or` / `and` (仅 tcping/httping) |
 | `HTTPING_MODE` | `strict` | HTTPing 判定模式: `strict` / `standard` / `loose` |
-| `HTTPING_HOST` | (空) | HTTPing 请求的 Host 头 (见下方说明) |
+| `HTTPING_HOST` | (空) | HTTPing 访问域名，同时作为 Host 头和 SNI (见上方说明) |
 | `HTTPING_VERIFY_TLS` | `false` | TLS 证书验证 (true=证书无效判 dead) |
+| `HTTPING_CA_FILE` | (空) | 自定义 CA 证书文件，留空=系统 CA |
 | `CHECK_COUNT` | `5` | 每个目标发送探测次数 |
 | `CHECK_TIMEOUT` | `2` | 单次探测超时 (秒) |
 | `ALIVE_THRESHOLD` | `4` | 至少成功 N 次才算存活 |
@@ -205,7 +211,7 @@ SAFETY_THRESHOLD=20    # 可达率低于 20% 时中止
 AUTO_REMOVE_DEAD=true    # 开启自动清理
 ```
 
-适合 IP 列表经常变动、需要自动淘汰失效 IP 的场景。脚本会在 DNS 同步完成后，逐行匹配并移除不通的目标（ping 模式删 IP，tcping 模式删 IP:端口）。
+适合 IP 列表经常变动、需要自动淘汰失效 IP 的场景。脚本会在 DNS 同步完成后，逐行解析并精确匹配不通的目标（ping 模式删 IP，tcping 模式删 IP:端口，httping 模式删 URL），例如清理 `1.1.1.1` 不会误删 `1.1.1.10`；注释行原样保留。AND 模式下被整体判死的 IP，其所有端口都会被清理；仅因 `MAX_DNS_RECORDS` 上限被排除的存活 IP 不会被清理。
 
 **注意：** 删除是不可逆的，建议配合安全阀一起使用。如果本机网络故障导致全部检测失败，安全阀会先拦住，不会误清整个列表。
 
@@ -235,7 +241,7 @@ bash /你的路径/Ping-DNSync/ping-dnsync.sh
 [2026-06-07 19:31:00] [INFO ] =================================================
 [2026-06-07 19:31:01] [INFO ] Zone ID: 99452965616b485fbf35a342871258e0
 [2026-06-07 19:31:01] [INFO ] [2/4] Ping 检测 (x5, >=4 才算存活)
-  Target                   Sent     Recv     Loss%    Avg(ms)
+  Target                   Sent     Recv     Loss%    Avg(ms)    Note
   1.1.1.1                  5        5        0.00     2.219
   1.0.0.1                  5        5        0.00     2.445
   8.8.8.8                  5        0        100.00   -
